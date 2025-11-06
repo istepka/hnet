@@ -39,7 +39,7 @@ def load_from_pretrained(model_path: str, model_config_path: str):
     model.eval()
 
     # Load checkpoint
-    major, minor = map(int, torch.__version__.split('.')[:2])
+    major, minor = map(int, torch.__version__.split(".")[:2])
     if (major, minor) >= (2, 6):
         with torch.serialization.safe_globals([ListConfig]):
             state_dict = torch.load(model_path, map_location=device, weights_only=False)
