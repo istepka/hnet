@@ -1,25 +1,40 @@
-import numpy as np
 import json
-import torch
 import os
-import hydra
-from omegaconf import DictConfig, OmegaConf
-from pprint import pprint
 from collections import defaultdict
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+from pprint import pprint
+
+import hydra
+import numpy as np
+import torch
 from datasets import load_dataset
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
+
+from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
 
 # HNet imports
-from hnet.models.mixer_seq import HNetForCausalLM
-from hnet.models.config_hnet import (
-    AttnConfig,
-    SSMConfig,
-    HNetConfig,
-)
+from hnet.models.mixer_seq import CausalLMOutput, HNetForCausalLM
 from hnet.utils.tokenizers import ByteTokenizer
 from hnet.utils.train import load_balancing_loss
 from train_helpers import plot_loss_curves, plot_words, prepare_group_params
+
+
+class TokDataset(torch.utils.data.Dataset):
+    def __init__(self, path: str, block_size: int) -> None:
+        self.data = torch.from_numpy(np.memmap(path, dtype=np.int32, mode="r"))
+        self.block_size = block_size
+
+    def __len__(self) -> int:
+        return len(self.data) // self.block_size - 1
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        i = idx * self.block_size
+        x = self.data[i : i + self.block_size + 1]  # +1 for shifting later
+        return x
+
+
+def collate_batch(batch) -> torch.Tensor:
+    return torch.stack(batch)
 
 
 @hydra.main(version_base=None, config_path=".", config_name="config")
@@ -35,10 +50,17 @@ def main(cfg: DictConfig) -> None:
     model_config_path = hydra.utils.to_absolute_path(cfg.model.config_path)
     with open(model_config_path, "r") as f:
         config = json.load(f)
-        
+
     experiment_dir = cfg.paths.experiment_dir
+    data_dir = cfg.paths.data_dir
     expeirment_name = cfg.name
     output_dir = os.path.join(experiment_dir, expeirment_name)
+    tokens_dir = os.path.join(data_dir, "tokens")
+    ckpt_path = cfg.paths.checkpoint_save_path
+    ckpt_path = os.path.join(ckpt_path, cfg.name)
+    os.makedirs(tokens_dir, exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(ckpt_path, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
     attn_cfg = AttnConfig(**config.pop("attn_cfg"))
@@ -52,43 +74,45 @@ def main(cfg: DictConfig) -> None:
 
     # --- 2. Data Preparation ---
     print(f"Loading tokenizer and dataset '{cfg.data.name}'...")
+    tokens_path = os.path.join(data_dir, f"{cfg.data.name}_tokens.bin")
+    input_len = cfg.data.input_len
     tokenizer = ByteTokenizer()
 
-    # Using 'ag_news' as per your notebook
+    if not os.path.exists(tokens_path) or cfg.data.regenerate_tokens:
+        print("Tokenized data not found, creating...")
 
-    dataset = load_dataset(cfg.data.name)
-    train_data = dataset["train"]
+        dataset = load_dataset(cfg.data.name)
+        all_train_texts = [doc["text"] for doc in dataset["train"]]
+        encoded_inputs = tokenizer.encode(all_train_texts, add_bos=True, add_eos=True)
 
-    all_train_texts = [doc["text"] for doc in train_data]
+        longs_ids = list()
+        for ids in encoded_inputs:
+            longs_ids.extend(ids["input_ids"])
 
-    encoded_inputs = tokenizer.encode(all_train_texts, add_bos=True, add_eos=True)
-    encoded_inputs_ids = [ids["input_ids"] for ids in encoded_inputs]
-    input_ids_list = [
-        torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-        for ids in encoded_inputs_ids
-    ]
+        # Save tokenized data to binary file for memory mapping
+        np.array(longs_ids, dtype=np.int32).tofile(tokens_path)
+        del encoded_inputs
+        del longs_ids
+        del all_train_texts
+        del dataset
 
-    # Filter and trim
-    input_len = cfg.data.input_len
-    training_data = []
-    for ids in input_ids_list:
-        if ids.shape[1] < input_len:
-            continue
-        elif ids.shape[1] > input_len:
-            ids = ids[:, :input_len]
-        training_data.append(ids)
-
-    print(f"Total training samples after filtering: {len(training_data)}")
-
-    # TODO: ConcatDataset is memory-intensive. For large data, this should be a streaming map-style dataset
-    training_data_cat = torch.utils.data.ConcatDataset(training_data)
+    dataset = TokDataset(tokens_path, block_size=input_len)
     batched_training_data = torch.utils.data.DataLoader(
-        training_data_cat, batch_size=cfg.data.batch_size, shuffle=True
+        dataset,
+        batch_size=cfg.data.batch_size,
+        shuffle=cfg.data.shuffle,
+        drop_last=True,
+        num_workers=cfg.data.num_workers,
+        pin_memory=cfg.data.pin_memory,
+        collate_fn=collate_batch,
     )
 
     # --- 3. Optimization Setup  ---
-    optimizer = prepare_group_params(model, cfg.optimizer)
+    optimizer = prepare_group_params(
+        model, cfg.lr_multipliers, cfg.training.base_lr, cfg.training.weight_decay
+    )
     ce_loss = torch.nn.CrossEntropyLoss()
+    alpha = torch.tensor(cfg.training.alpha, dtype=torch.bfloat16, device=device)
 
     # --- 4. Training Loop  ---
     print("Starting training...")
@@ -98,25 +122,25 @@ def main(cfg: DictConfig) -> None:
     tq_bar = tqdm(total=cfg.training.total_steps, desc="Total Training Steps")
 
     step = 0
-    for epoch in range(cfg.training.max_epochs):
-        print(f"Epoch {epoch + 1}")
+    finished = False
+    while not finished:
         metric_aggregator = defaultdict(list)
 
-        for input_ids_BxL in batched_training_data:
-            optimizer.zero_grad()
-            mask = torch.ones(input_ids_BxL.shape, device=device, dtype=torch.bool)
+        for x in batched_training_data:
+            assert isinstance(x, torch.Tensor), "Batch data should be a torch.Tensor"
+            x = x.to(device, non_blocking=True, dtype=torch.long)
+            inputs = x[:, :-1]
+            labels = x[:, 1:]
 
-            output = model.forward(input_ids_BxL, mask=mask)
-            
-            logits_BxLxV: torch.Tensor = output.logits
+            optimizer.zero_grad()
+            mask = torch.ones(inputs.shape, device=device, dtype=torch.bool)
+            output: CausalLMOutput = model(inputs, mask=mask)
+            logits = output.logits
             bpred = output.bpred_output
 
-            shift_logits = logits_BxLxV[:, :-1, :].contiguous()
-            shift_labels = input_ids_BxL[:, 1:].contiguous()
-
-            ce = ce_loss(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
+            # Align logits and labels
+            ce: torch.Tensor = ce_loss(
+                logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
             )
 
             lb_loss = torch.tensor(0.0, device=device)
@@ -129,16 +153,15 @@ def main(cfg: DictConfig) -> None:
                     lb_loss = lb_loss + stage_loss
                     metric_aggregator[f"lb_loss_stage-{i}"].append(stage_loss.item())
 
-            loss = ce + cfg.training.alpha * lb_loss
+            loss = ce + alpha * lb_loss
+            loss.backward()
+            optimizer.step()
 
             metric_aggregator["ce_loss"].append(ce.item())
             metric_aggregator["lb_loss_total"].append(
                 lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss
             )
             metric_aggregator["total_loss"].append(loss.item())
-
-            loss.backward()
-            optimizer.step()
 
             step += 1
             tq_bar.update(1)
@@ -149,19 +172,27 @@ def main(cfg: DictConfig) -> None:
                     experiment_logs[key].append((step, avg_value))
                 metric_aggregator = defaultdict(list)  # Clear aggregator
 
+            if step % cfg.training.save_every == 0:
+                torch.save(
+                    model.state_dict(), os.path.join(ckpt_path, f"step_{step}.pt")
+                )
+
             if step >= cfg.training.total_steps:
+                finished = True
                 break
 
-        if step >= cfg.training.total_steps:
-            break
+    torch.save(model.state_dict(), os.path.join(ckpt_path, f"step_{step}.pt"))
 
     tq_bar.close()
-    print("Training finished.")
+    print("Training finished")
 
     # --- 5. Plotting  ---
     # Hydra will save these plots to the output directory
     print("Generating plots")
-    plot_loss_curves(experiment_logs, save_path=os.path.join(output_dir, "loss_curves.png"))
+    model.eval()
+    plot_loss_curves(
+        experiment_logs, save_path=os.path.join(output_dir, "loss_curves.png")
+    )
     plot_words(
         model,
         tokenizer,

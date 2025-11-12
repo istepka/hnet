@@ -1,36 +1,23 @@
-import numpy as np
-import json
-import torch
-import os
-import hydra
-from omegaconf import DictConfig, OmegaConf
-from pprint import pprint
-from collections import defaultdict
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-from datasets import load_dataset
+import numpy as np
+import torch
+from tokenizers import ByteTokenizer
 
 # HNet imports
 from hnet.models.mixer_seq import HNetForCausalLM
-from hnet.models.config_hnet import (
-    AttnConfig,
-    SSMConfig,
-    HNetConfig,
-)
-from hnet.utils.tokenizers import ByteTokenizer
-from hnet.utils.train import group_params, apply_optimization_params
+from hnet.utils.train import apply_optimization_params, group_params
 
 
-
-def prepare_group_params(model: HNetForCausalLM, cfg: DictConfig) -> torch.optim.AdamW:
+def prepare_group_params(
+    model: HNetForCausalLM,
+    lr_multipliers: list[float],
+    base_lr: float,
+    weight_decay: float,
+) -> torch.optim.AdamW:
     """
     Prepares optimizer parameter groups with different learning rates and weight decays.
     Hardcoded for 2stage HNet model as per the current configuration.
     """
-
-    lr_multipliers = list(cfg.lr_multipliers)
-    num_stages = 2  # Based on your model config
-
     assert hasattr(model.backbone.main_network, "encoder"), "Model is not S=2"
     assert len(lr_multipliers) == 3, "Expecting 3 LR multipliers for S=2 model"
 
@@ -83,18 +70,16 @@ def prepare_group_params(model: HNetForCausalLM, cfg: DictConfig) -> torch.optim
     # Convert lr_mult to absolute lr
     for g in gparams:
         if "lr_mult" in g:
-            g["lr"] = cfg.base_lr * g.pop("lr_mult")
+            g["lr"] = base_lr * g.pop("lr_mult")
         if "weight_decay" not in g:
-            g["weight_decay"] = cfg.weight_decay
+            g["weight_decay"] = weight_decay
 
-    optimizer = torch.optim.AdamW(
-        gparams, lr=cfg.base_lr, weight_decay=cfg.weight_decay
-    )
+    optimizer = torch.optim.AdamW(gparams, lr=base_lr, weight_decay=weight_decay)
     print("\nOptimizer groups are set up and ready.")
     return optimizer
 
 
-def plot_loss_curves(experiment_logs: dict, save_path="loss_curves.png") -> None:
+def plot_loss_curves(experiment_logs: dict, save_path: str = "loss_curves.png") -> None:
     """
     Plots the training loss curves.
     """
@@ -129,7 +114,13 @@ def plot_loss_curves(experiment_logs: dict, save_path="loss_curves.png") -> None
     print(f"Saved loss curves to {save_path}")
 
 
-def plot_words(model, tokenizer, sentences: list[str], device, save_path="word_boundaries.png"):
+def plot_words(
+    model: HNetForCausalLM,
+    tokenizer: ByteTokenizer,
+    sentences: list[str],
+    device: str,
+    save_path: str = "word_boundaries.png",
+) -> None:
     """
     Plots the dynamic chunking boundaries for a sample sentence.
     (From the last cell)
@@ -234,8 +225,7 @@ def plot_words(model, tokenizer, sentences: list[str], device, save_path="word_b
                 spine.set_visible(False)
             ax.set_xticks([])
             plt.tight_layout()
-            plt.savefig(save_path + f'{i}.png', dpi=300, bbox_inches='tight')
+            plt.savefig(save_path + f"{i}.png", dpi=300, bbox_inches="tight")
             plt.close()
-            
-        print(f"Saved boundary visualizations to {save_path}")
 
+        print(f"Saved boundary visualizations to {save_path}")

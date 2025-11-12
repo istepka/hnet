@@ -13,8 +13,8 @@ hydra:
 paths:
   project_root: /home/${oc.env:USER}/hnet
   scratch_dir: /home/scratch/${oc.env:USER}
-  data_dir: /data/user_data/${oc.env:USER}/data/
-  checkpoint_save_path: /data/user_data/${oc.env:USER}/checkpoints"
+  data_dir: /data/user_data/${oc.env:USER}/data/hnet
+  checkpoint_save_path: /data/user_data/${oc.env:USER}/checkpoints
   experiment_dir: ${paths.project_root}/experiments
   model_cache: ${paths.scratch_dir}/model_cache
   hf_cache: /data/hf_cache
@@ -28,6 +28,11 @@ data:
   name: ag_news
   input_len: 256
   batch_size: 64 # Batch size for training, 128 x 256 fits on L40s GPU 
+  num_workers: 2
+  pin_memory: false
+  shuffle: true
+  regenerate_tokens: false
+  
 
 name: hnet_${data.name}_${model.stages}stage_${model.size}
 
@@ -38,11 +43,11 @@ optimizer:
 
 training:
   device: cuda
-  max_epochs: 5
-  total_steps: 300
+  total_steps: 1000
   log_every: 25
   alpha: 0.03 # Ratio loss weight
   n_ratios: [3, 3]  # N ratios for [Stage 0, Stage 1]
+  save_every: 1000  # Save checkpoint every N steps
 
 plotting:
   plot_sentence: "The quick brown fox jumps over the lazy dog."
