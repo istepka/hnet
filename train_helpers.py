@@ -1,10 +1,10 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from tokenizers import ByteTokenizer
 
 # HNet imports
 from hnet.models.mixer_seq import HNetForCausalLM
+from hnet.utils.tokenizers import ByteTokenizer
 from hnet.utils.train import apply_optimization_params, group_params
 
 
@@ -19,7 +19,9 @@ def prepare_group_params(
     Hardcoded for 2stage HNet model as per the current configuration.
     """
     assert hasattr(model.backbone.main_network, "encoder"), "Model is not S=2"
-    assert len(lr_multipliers) == 3, "Expecting 3 LR multipliers for S=2 model"
+    assert (
+        len(lr_multipliers) == 3
+    ), f"Expecting 3 LR multipliers for S=2, got {len(lr_multipliers)}"
 
     print("Pre-annotating model parameters with LR multipliers...")
     for name, param in model.named_parameters():
@@ -119,13 +121,14 @@ def plot_words(
     tokenizer: ByteTokenizer,
     sentences: list[str],
     device: str,
-    save_path: str = "word_boundaries.png",
-) -> None:
+    save_path: str = "word_boundaries",
+) -> list[str]:
     """
     Plots the dynamic chunking boundaries for a sample sentence.
     (From the last cell)
     """
     model.eval()
+    paths = []
 
     for i, sentence in enumerate(sentences):
         encoded = tokenizer.encode([sentence], add_bos=True)
@@ -156,7 +159,7 @@ def plot_words(
             print(f"Compression Ratio Stage 0: {compression_ratio_stage0:.2f}")
             print(f"Compression Ratio Stage 1: {compression_ratio_stage1:.2f}")
 
-            fig, ax = plt.subplots(figsize=(12, 2.5))
+            fig, ax = plt.subplots(figsize=(14, 2.5))
 
             sentence_vis = "#" + sentence
             tokens = encoded_ids
@@ -225,7 +228,11 @@ def plot_words(
                 spine.set_visible(False)
             ax.set_xticks([])
             plt.tight_layout()
-            plt.savefig(save_path + f"{i}.png", dpi=300, bbox_inches="tight")
+            path = save_path + f"{i}.png"
+            plt.savefig(path, dpi=300, bbox_inches="tight")
             plt.close()
 
+            paths.append(path)
+
         print(f"Saved boundary visualizations to {save_path}")
+    return paths

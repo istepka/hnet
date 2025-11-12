@@ -1,6 +1,10 @@
 outputs/
 .vscode/
 uv.lock
+wandb/
+checkpoints 
+data 
+exeriments
 
 
 # Byte-compiled / optimized / DLL files

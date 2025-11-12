@@ -10,6 +10,7 @@ from datasets import load_dataset
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+import wandb
 from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
 
 # HNet imports
@@ -51,17 +52,27 @@ def main(cfg: DictConfig) -> None:
     with open(model_config_path, "r") as f:
         config = json.load(f)
 
+    unique_id = wandb.util.generate_id()
     experiment_dir = cfg.paths.experiment_dir
     data_dir = cfg.paths.data_dir
     expeirment_name = cfg.name
-    output_dir = os.path.join(experiment_dir, expeirment_name)
+    output_dir = os.path.join(experiment_dir, expeirment_name + "_" + unique_id)
     tokens_dir = os.path.join(data_dir, "tokens")
     ckpt_path = cfg.paths.checkpoint_save_path
-    ckpt_path = os.path.join(ckpt_path, cfg.name)
+    ckpt_path = os.path.join(ckpt_path, cfg.name + "_" + unique_id)
     os.makedirs(tokens_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(ckpt_path, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
+
+    _ = wandb.init(
+        entity="istepka-carnegie-mellon-university",
+        project="hnet",
+        name=expeirment_name,
+        config=OmegaConf.to_container(cfg, resolve=True),
+    )
+
+    wandb.config.update({"model_config": config})
 
     attn_cfg = AttnConfig(**config.pop("attn_cfg"))
     ssm_cfg = SSMConfig(**config.pop("ssm_cfg"))
@@ -70,6 +81,7 @@ def main(cfg: DictConfig) -> None:
     print("Loading model...")
     model = HNetForCausalLM(hnet_cfg, device=device, dtype=torch.bfloat16)
     total_params = sum(p.numel() for p in model.parameters())
+    wandb.config.update({"total_params": total_params})
     print(f"Total number of parameters: {total_params / 1e6:.2f}M")
 
     # --- 2. Data Preparation ---
@@ -81,16 +93,19 @@ def main(cfg: DictConfig) -> None:
     if not os.path.exists(tokens_path) or cfg.data.regenerate_tokens:
         print("Tokenized data not found, creating...")
 
-        dataset = load_dataset(cfg.data.name)
+        dataset = load_dataset(**cfg.data[cfg.data.name], cache_dir=cfg.paths.hf_cache)
+        print("Downloaded")
         all_train_texts = [doc["text"] for doc in dataset["train"]]
+        print(
+            f"Len {len(all_train_texts)}, MBs: {sum(len(t) for t in all_train_texts) / 1e6:.2f}MB "
+        )
         encoded_inputs = tokenizer.encode(all_train_texts, add_bos=True, add_eos=True)
 
         longs_ids = list()
         for ids in encoded_inputs:
-            longs_ids.extend(ids["input_ids"])
-
-        # Save tokenized data to binary file for memory mapping
-        np.array(longs_ids, dtype=np.int32).tofile(tokens_path)
+            longs_ids.append(np.array(ids["input_ids"], dtype=np.int32))
+        print("Saving tokenized data")
+        np.concatenate(longs_ids).tofile(tokens_path)
         del encoded_inputs
         del longs_ids
         del all_train_texts
@@ -108,9 +123,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     # --- 3. Optimization Setup  ---
-    optimizer = prepare_group_params(
-        model, cfg.lr_multipliers, cfg.training.base_lr, cfg.training.weight_decay
-    )
+    optimizer = prepare_group_params(model, **cfg.optimizer)
     ce_loss = torch.nn.CrossEntropyLoss()
     alpha = torch.tensor(cfg.training.alpha, dtype=torch.bfloat16, device=device)
 
@@ -152,10 +165,21 @@ def main(cfg: DictConfig) -> None:
                     )
                     lb_loss = lb_loss + stage_loss
                     metric_aggregator[f"lb_loss_stage-{i}"].append(stage_loss.item())
+                    wandb.log({f"lb_loss_stage-{i}": stage_loss.item()})
 
             loss = ce + alpha * lb_loss
             loss.backward()
             optimizer.step()
+
+            wandb.log(
+                {
+                    "ce_loss": ce.item(),
+                    "lb_loss_total": lb_loss.item()
+                    if torch.is_tensor(lb_loss)
+                    else lb_loss,
+                    "total_loss": loss.item(),
+                }
+            )
 
             metric_aggregator["ce_loss"].append(ce.item())
             metric_aggregator["lb_loss_total"].append(
@@ -182,6 +206,7 @@ def main(cfg: DictConfig) -> None:
                 break
 
     torch.save(model.state_dict(), os.path.join(ckpt_path, f"step_{step}.pt"))
+    wandb.save(os.path.join(ckpt_path, f"step_{step}.pt"))
 
     tq_bar.close()
     print("Training finished")
@@ -193,14 +218,19 @@ def main(cfg: DictConfig) -> None:
     plot_loss_curves(
         experiment_logs, save_path=os.path.join(output_dir, "loss_curves.png")
     )
-    plot_words(
+    paths = plot_words(
         model,
         tokenizer,
         cfg.plotting.plot_sentences,
         device,
         save_path=os.path.join(output_dir, "word_boundaries"),
     )
+    for i, path in enumerate(paths):
+        wandb.log({f"word_boundary_plot_{i}": wandb.Image(path)})
+
     print(f"Run complete. Outputs saved to {output_dir}")
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
