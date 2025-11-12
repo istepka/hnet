@@ -1,0 +1,48 @@
+# config.yaml
+# Hydra configuration file for train.py
+
+defaults:
+  - _self_
+  - override hydra/job_logging: disabled # No fluff
+  - override hydra/hydra_logging: disabled # No fluff
+
+hydra:
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+paths:
+  project_root: /home/${oc.env:USER}/hnet
+  scratch_dir: /home/scratch/${oc.env:USER}
+  data_dir: /data/user_data/${oc.env:USER}/data/
+  checkpoint_save_path: /data/user_data/${oc.env:USER}/checkpoints"
+  experiment_dir: ${paths.project_root}/experiments
+  model_cache: ${paths.scratch_dir}/model_cache
+  hf_cache: /data/hf_cache
+
+model:
+  stages: 2
+  size: L
+  config_path: "configs/hnet_${model.stages}stage_${model.size}.json"
+
+data:
+  name: ag_news
+  input_len: 256
+  batch_size: 64 # Batch size for training, 128 x 256 fits on L40s GPU 
+
+name: hnet_${data.name}_${model.stages}stage_${model.size}
+
+optimizer:
+  base_lr: 6.25e-4
+  weight_decay: 0.1
+  lr_multipliers: [2.0, 1.5, 1.0]   # [Stage 0, Stage 1, Main Network]
+
+training:
+  device: cuda
+  max_epochs: 5
+  total_steps: 300
+  log_every: 25
+  alpha: 0.03 # Ratio loss weight
+  n_ratios: [3, 3]  # N ratios for [Stage 0, Stage 1]
+
+plotting:
+  plot_sentence: "The quick brown fox jumps over the lazy dog."
