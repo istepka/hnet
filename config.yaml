@@ -25,11 +25,12 @@ model:
   config_path: "configs/hnet_${model.stages}stage_${model.size}.json"
 
 data:
-  name: wikitext
-  input_len: 512 # Input sequence length / context size
-  batch_size: 64 # Batch size for training, 128 x 256 fits on L40s GPU 
+  name: c4
+  input_len: 1024 # Input sequence length / context size
+  batch_size: 20 # Batch size for training, 128 x 256 fits on L40s GPU 
   num_workers: 2
   pin_memory: false
+  prefetch_factor: null
   shuffle: true
   regenerate_tokens: false
   ag_news:
@@ -38,10 +39,16 @@ data:
   wikitext:
     path: Salesforce/wikitext
     name: wikitext-103-v1
+  c4:
+    path: allenai/c4
+    name: en
+    streaming: True
+    take_rows: 2000000 # Take 2M rows
     
   
 
-name: hnet_${data.name}_${model.stages}stage_${model.size}
+# name: hnet_${data.name}_${model.stages}stage_${model.size}
+name: debug_c4
 
 optimizer:
   base_lr: 6.25e-4

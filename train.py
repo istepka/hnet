@@ -6,11 +6,11 @@ from pprint import pprint
 import hydra
 import numpy as np
 import torch
-from datasets import load_dataset
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 import wandb
+from data import prepare_tokenized_data
 from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
 
 # HNet imports
@@ -57,10 +57,9 @@ def main(cfg: DictConfig) -> None:
     data_dir = cfg.paths.data_dir
     expeirment_name = cfg.name
     output_dir = os.path.join(experiment_dir, expeirment_name + "_" + unique_id)
-    tokens_dir = os.path.join(data_dir, "tokens")
+    tokens_dir = os.path.join(data_dir, "tokens", cfg.data.name)
     ckpt_path = cfg.paths.checkpoint_save_path
     ckpt_path = os.path.join(ckpt_path, cfg.name + "_" + unique_id)
-    os.makedirs(tokens_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(ckpt_path, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
@@ -78,38 +77,18 @@ def main(cfg: DictConfig) -> None:
     ssm_cfg = SSMConfig(**config.pop("ssm_cfg"))
     hnet_cfg = HNetConfig(**config, attn_cfg=attn_cfg, ssm_cfg=ssm_cfg)
 
-    print("Loading model...")
-    model = HNetForCausalLM(hnet_cfg, device=device, dtype=torch.bfloat16)
-    total_params = sum(p.numel() for p in model.parameters())
-    wandb.config.update({"total_params": total_params})
-    print(f"Total number of parameters: {total_params / 1e6:.2f}M")
-
     # --- 2. Data Preparation ---
     print(f"Loading tokenizer and dataset '{cfg.data.name}'...")
-    tokens_path = os.path.join(data_dir, f"{cfg.data.name}_tokens.bin")
     input_len = cfg.data.input_len
     tokenizer = ByteTokenizer()
 
-    if not os.path.exists(tokens_path) or cfg.data.regenerate_tokens:
-        print("Tokenized data not found, creating...")
-
-        dataset = load_dataset(**cfg.data[cfg.data.name], cache_dir=cfg.paths.hf_cache)
-        print("Downloaded")
-        all_train_texts = [doc["text"] for doc in dataset["train"]]
-        print(
-            f"Len {len(all_train_texts)}, MBs: {sum(len(t) for t in all_train_texts) / 1e6:.2f}MB "
-        )
-        encoded_inputs = tokenizer.encode(all_train_texts, add_bos=True, add_eos=True)
-
-        longs_ids = list()
-        for ids in encoded_inputs:
-            longs_ids.append(np.array(ids["input_ids"], dtype=np.int32))
-        print("Saving tokenized data")
-        np.concatenate(longs_ids).tofile(tokens_path)
-        del encoded_inputs
-        del longs_ids
-        del all_train_texts
-        del dataset
+    tokens_path = prepare_tokenized_data(
+        tokenizer=tokenizer,
+        tokens_path=tokens_dir,
+        hf_cache_path=cfg.paths.hf_cache,
+        regenerate=cfg.data.regenerate_tokens,
+        **cfg.data[cfg.data.name],
+    )
 
     dataset = TokDataset(tokens_path, block_size=input_len)
     batched_training_data = torch.utils.data.DataLoader(
@@ -119,10 +98,17 @@ def main(cfg: DictConfig) -> None:
         drop_last=True,
         num_workers=cfg.data.num_workers,
         pin_memory=cfg.data.pin_memory,
+        prefetch_factor=cfg.data.prefetch_factor,
         collate_fn=collate_batch,
     )
 
     # --- 3. Optimization Setup  ---
+    print("Loading model...")
+    model = HNetForCausalLM(hnet_cfg, device=device, dtype=torch.bfloat16)
+    total_params = sum(p.numel() for p in model.parameters())
+    wandb.config.update({"total_params": total_params})
+    print(f"Total number of parameters: {total_params / 1e6:.2f}M")
+
     optimizer = prepare_group_params(model, **cfg.optimizer)
     ce_loss = torch.nn.CrossEntropyLoss()
     alpha = torch.tensor(cfg.training.alpha, dtype=torch.bfloat16, device=device)
@@ -136,6 +122,7 @@ def main(cfg: DictConfig) -> None:
 
     step = 0
     finished = False
+    processed_tokens = 0
     while not finished:
         metric_aggregator = defaultdict(list)
 
@@ -171,24 +158,22 @@ def main(cfg: DictConfig) -> None:
             loss.backward()
             optimizer.step()
 
-            wandb.log(
-                {
-                    "ce_loss": ce.item(),
-                    "lb_loss_total": lb_loss.item()
-                    if torch.is_tensor(lb_loss)
-                    else lb_loss,
-                    "total_loss": loss.item(),
-                }
-            )
-
             metric_aggregator["ce_loss"].append(ce.item())
-            metric_aggregator["lb_loss_total"].append(
-                lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss
-            )
+            metric_aggregator["lb_loss_total"].append(lb_loss.item())
             metric_aggregator["total_loss"].append(loss.item())
 
             step += 1
             tq_bar.update(1)
+            processed_tokens += inputs.numel()
+
+            wandb.log(
+                {
+                    "ce_loss": ce.item(),
+                    "lb_loss_total": lb_loss.item(),
+                    "total_loss": loss.item(),
+                    "processed_tokens": processed_tokens,
+                }
+            )
 
             if step % cfg.training.log_every == 0:
                 for key, values in metric_aggregator.items():
@@ -200,6 +185,24 @@ def main(cfg: DictConfig) -> None:
                 torch.save(
                     model.state_dict(), os.path.join(ckpt_path, f"step_{step}.pt")
                 )
+
+                # Evaluation plots during training
+                model.eval()
+                with torch.no_grad():
+                    paths = plot_words(
+                        model,
+                        tokenizer,
+                        cfg.plotting.plot_sentences,
+                        device,
+                        save_path=os.path.join(output_dir, f"word_boundaries_s{step}"),
+                    )
+                    for i, path in enumerate(paths):
+                        wandb.log({f"word_boundary_plot_{i}": wandb.Image(path)})
+
+                # TODO: compression ratio
+                # TODO: perplexity on validation set
+
+                model.train()
 
             if step >= cfg.training.total_steps:
                 finished = True
