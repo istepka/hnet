@@ -33,18 +33,21 @@ data:
   prefetch_factor: null
   shuffle: true
   regenerate_tokens: false
-  ag_news:
-    path: ag_news 
-    name: null
-  wikitext:
-    path: Salesforce/wikitext
-    name: wikitext-103-v1
+  # ag_news:
+  #   path: ag_news 
+  #   name: null
+  # wikitext:
+  #   path: Salesforce/wikitext
+  #   name: wikitext-103-v1
+  #   streaming: Fals
   c4:
     path: allenai/c4
     name: en
-    streaming: True
-    take_rows: 2000000 # Take 2M rows
-    
+    streaming: True # if streaming then we use take_rows
+    train:
+      take_rows: 2000000 # Take 2M rows
+    valid:
+      take_rows: 10000 # Take 10k rows
   
 
 # name: hnet_${data.name}_${model.stages}stage_${model.size}
@@ -60,13 +63,15 @@ training:
   total_steps: 1000 # Total training steps (batches)
   log_every: 50 # Log training metrics every N steps
   alpha: 0.03 # Ratio loss weight
-  n_ratios: [3, 3]  # N ratios for [Stage 0, Stage 1]
-  save_every: 500  # Save checkpoint every N steps
+  n_ratios: [3, 2]  # N ratios for [Stage 0, Stage 1]
+  save_every: 250  # Save checkpoint every N steps
+  val_every: 100  # Validate every N steps
 
 plotting:
   plot_sentences: 
     - The quick brown fox jumps over the lazy dog.
     - Wikipedia is a free online encyclopedia that aims to provide.
+    - Schenley Park is a great place for a walk in Pittsburgh.
     - Artificial intelligence is transforming the world in many ways.
     - kabksbklbfieugf uiahefwuhl aleuhu evjhl hiseualghfiueigu
     - ababababababababababababababababababababababababababa

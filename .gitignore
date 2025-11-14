@@ -5,6 +5,7 @@ wandb/
 checkpoints 
 data 
 exeriments
+slurm/
 
 
 # Byte-compiled / optimized / DLL files

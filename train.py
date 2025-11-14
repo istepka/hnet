@@ -72,6 +72,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     wandb.config.update({"model_config": config})
+    wandb.define_metric("val/*", summary="mean")
 
     attn_cfg = AttnConfig(**config.pop("attn_cfg"))
     ssm_cfg = SSMConfig(**config.pop("ssm_cfg"))
@@ -82,19 +83,41 @@ def main(cfg: DictConfig) -> None:
     input_len = cfg.data.input_len
     tokenizer = ByteTokenizer()
 
-    tokens_path = prepare_tokenized_data(
+    train_tokens_path = prepare_tokenized_data(
         tokenizer=tokenizer,
-        tokens_path=tokens_dir,
+        tokens_path=os.path.join(tokens_dir, "train"),
         hf_cache_path=cfg.paths.hf_cache,
         regenerate=cfg.data.regenerate_tokens,
+        take_rows=cfg.data[cfg.data.name].train.take_rows,
+        split="train",
+        **cfg.data[cfg.data.name],
+    )
+    valid_tokens_path = prepare_tokenized_data(
+        tokenizer=tokenizer,
+        tokens_path=os.path.join(tokens_dir, "validation"),
+        hf_cache_path=cfg.paths.hf_cache,
+        regenerate=cfg.data.regenerate_tokens,
+        take_rows=cfg.data[cfg.data.name].valid.take_rows,
+        split="validation",
         **cfg.data[cfg.data.name],
     )
 
-    dataset = TokDataset(tokens_path, block_size=input_len)
-    batched_training_data = torch.utils.data.DataLoader(
-        dataset,
+    train_dataset = TokDataset(train_tokens_path, block_size=input_len)
+    valid_dataset = TokDataset(valid_tokens_path, block_size=input_len)
+    train_dl = torch.utils.data.DataLoader(
+        train_dataset,
         batch_size=cfg.data.batch_size,
         shuffle=cfg.data.shuffle,
+        drop_last=True,
+        num_workers=cfg.data.num_workers,
+        pin_memory=cfg.data.pin_memory,
+        prefetch_factor=cfg.data.prefetch_factor,
+        collate_fn=collate_batch,
+    )
+    valid_dl = torch.utils.data.DataLoader(
+        valid_dataset,
+        batch_size=cfg.data.batch_size,
+        shuffle=False,
         drop_last=True,
         num_workers=cfg.data.num_workers,
         pin_memory=cfg.data.pin_memory,
@@ -126,7 +149,7 @@ def main(cfg: DictConfig) -> None:
     while not finished:
         metric_aggregator = defaultdict(list)
 
-        for x in batched_training_data:
+        for x in train_dl:
             assert isinstance(x, torch.Tensor), "Batch data should be a torch.Tensor"
             x = x.to(device, non_blocking=True, dtype=torch.long)
             inputs = x[:, :-1]
@@ -151,16 +174,23 @@ def main(cfg: DictConfig) -> None:
                         stage_i_bpred, N=cfg.training.n_ratios[i]
                     )
                     lb_loss = lb_loss + stage_loss
-                    metric_aggregator[f"lb_loss_stage-{i}"].append(stage_loss.item())
-                    wandb.log({f"lb_loss_stage-{i}": stage_loss.item()})
+                    metric_aggregator[f"train/lb_loss_stage-{i}"].append(
+                        stage_loss.item()
+                    )
+                    wandb.log(
+                        {f"train/lb_loss_stage-{i}": stage_loss.item()}, step=step
+                    )
 
             loss = ce + alpha * lb_loss
             loss.backward()
             optimizer.step()
 
+            ppl = torch.exp(ce).item()
+
             metric_aggregator["ce_loss"].append(ce.item())
             metric_aggregator["lb_loss_total"].append(lb_loss.item())
             metric_aggregator["total_loss"].append(loss.item())
+            metric_aggregator["perplexity"].append(ppl)
 
             step += 1
             tq_bar.update(1)
@@ -168,11 +198,13 @@ def main(cfg: DictConfig) -> None:
 
             wandb.log(
                 {
-                    "ce_loss": ce.item(),
-                    "lb_loss_total": lb_loss.item(),
-                    "total_loss": loss.item(),
-                    "processed_tokens": processed_tokens,
-                }
+                    "train/ce_loss": ce.item(),
+                    "train/lb_loss_total": lb_loss.item(),
+                    "train/total_loss": loss.item(),
+                    "train/processed_tokens": processed_tokens,
+                    "train/perplexity": ppl,
+                },
+                step=step,
             )
 
             if step % cfg.training.log_every == 0:
@@ -197,10 +229,42 @@ def main(cfg: DictConfig) -> None:
                         save_path=os.path.join(output_dir, f"word_boundaries_s{step}"),
                     )
                     for i, path in enumerate(paths):
-                        wandb.log({f"word_boundary_plot_{i}": wandb.Image(path)})
+                        wandb.log({f"wb/sentence_{i}": wandb.Image(path)}, step=step)
+                model.train()
 
-                # TODO: compression ratio
-                # TODO: perplexity on validation set
+            if step % cfg.training.val_every == 0:
+                model.eval()
+                with torch.no_grad():
+                    for val_x in tqdm(valid_dl, desc="Validation", total=len(valid_dl)):
+                        val_x = val_x.to(device, non_blocking=True, dtype=torch.long)
+                        inputs = val_x[:, :-1]
+                        labels = val_x[:, 1:]
+
+                        mask = torch.ones(inputs.shape, device=device, dtype=torch.bool)
+                        output: CausalLMOutput = model(inputs, mask=mask)
+                        logits = output.logits
+                        bpred = output.bpred_output
+
+                        # Compute cross-entropy loss
+                        ce = ce_loss(
+                            logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+                        )
+
+                        brped0_bm = bpred[0].boundary_mask.squeeze().cpu().numpy()
+                        brped1_bm = bpred[1].boundary_mask.squeeze().cpu().numpy()
+                        l = len(brped0_bm)  # noqa
+                        comp0 = l / (brped0_bm == 1).sum()
+                        comp1 = l / (brped1_bm == 1).sum()
+
+                        wandb.log(
+                            {
+                                "val/ce_loss": ce.item(),
+                                "val/perplexity": torch.exp(ce).item(),
+                                "val/compression_stage0": comp0,
+                                "val/compression_stage1": comp1,
+                            },
+                            step=step,
+                        )
 
                 model.train()
 
@@ -229,7 +293,7 @@ def main(cfg: DictConfig) -> None:
         save_path=os.path.join(output_dir, "word_boundaries"),
     )
     for i, path in enumerate(paths):
-        wandb.log({f"word_boundary_plot_{i}": wandb.Image(path)})
+        wandb.log({f"wb/sentence_{i}": wandb.Image(path)})
 
     print(f"Run complete. Outputs saved to {output_dir}")
 
