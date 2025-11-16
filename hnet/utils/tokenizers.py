@@ -32,7 +32,12 @@ class ByteTokenizer:
         return bytearray(tokens).decode("utf-8", **kwargs)
 
 
-class TSContinuousTokenizer:
+class TSTokenizer:
+    def requires_fit(self) -> bool:
+        return False
+
+
+class TSContinuousTokenizer(TSTokenizer):
     """
     This tokenizer is for continuous time series data.
 
@@ -41,6 +46,7 @@ class TSContinuousTokenizer:
     """
 
     def __init__(self):
+        super().__init__()
         self.dtype = np.float32
 
     def encode(self, seqs: list[np.ndarray], **kwargs) -> list[dict[str, np.ndarray]]:
@@ -56,21 +62,25 @@ class TSContinuousTokenizer:
         return tokens
 
 
-class TSQuantizedTokenizer:
+class TSQuantizedTokenizer(TSTokenizer):
     """
     This tokenizer is for quantized time series data.
 
     It converts float32 arrays to uint8 arrays and vice versa.
     """
 
-    def __init__(self, vocab_size: int = 256, quant_type: str = "linear"):
+    def __init__(self, vocab_size: int = 256, quant_type: str = "equiwidth"):
         """
         quant_type can be 'equiwidth' or 'cdf'
         """
+        super().__init__()
         self.vocab_size = vocab_size
         self.dtype = np.uint8
         self.quant_type = quant_type
         self.fit_called = False
+
+    def requires_fit(self):
+        return True
 
     def fit(self, data: np.ndarray):
         """

@@ -19,20 +19,23 @@ paths:
   model_cache: ${paths.scratch_dir}/model_cache
   hf_cache: /data/hf_cache
 
+wandb: 
+  use: false
+
 model:
   stages: 2
-  size: L
+  size: S
   config_path: "configs/hnet_${model.stages}stage_${model.size}.json"
 
 data:
-  name: c4
+  name: tslib
   input_len: 1024 # Input sequence length / context size
-  batch_size: 20 # Batch size for training, 128 x 256 fits on L40s GPU 
+  batch_size: 16 # Batch size for training, 128 x 256 fits on L40s GPU 
   num_workers: 2
   pin_memory: false
   prefetch_factor: null
   shuffle: true
-  regenerate_tokens: false
+  regenerate_tokens: true
   # ag_news:
   #   path: ag_news 
   #   name: null
@@ -41,17 +44,29 @@ data:
   #   name: wikitext-103-v1
   #   streaming: Fals
   c4:
-    path: allenai/c4
-    name: en
+    path: allenai/c4 # hf data main path
+    name: en # hf data subset
+    type: text # data type: text or timeseries
     streaming: True # if streaming then we use take_rows
     train:
       take_rows: 2000000 # Take 2M rows
     valid:
       take_rows: 10000 # Take 10k rows
-  
+  monash:
+    path: monash_tsf
+    name: weather
+    target: target
+    type: timeseries
+    streaming: False
+  tslib:
+    path: thuml/Time-Series-Library
+    name: weather 
+    target: OT
+    type: timeseries
+    streaming: False
 
 # name: hnet_${data.name}_${model.stages}stage_${model.size}
-name: debug_c4
+name: debug
 
 optimizer:
   base_lr: 6.25e-4

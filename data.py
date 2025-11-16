@@ -4,10 +4,14 @@ import shutil
 import numpy as np
 from datasets import load_dataset
 
-from hnet.utils.tokenizers import ByteTokenizer
+from hnet.utils.tokenizers import (
+    ByteTokenizer,
+    TSContinuousTokenizer,
+    TSQuantizedTokenizer,
+)
 
 
-def prepare_tokenized_data(
+def prepare_text_tokenized_data(
     tokenizer: ByteTokenizer,
     tokens_path: str,
     hf_cache_path: str,
@@ -111,3 +115,63 @@ def prepare_tokenized_data(
 
         print(f"Merged to {merged_path}")
         return merged_path
+
+
+def prepare_timeseries_tokenized_data(
+    tokenizer: TSContinuousTokenizer | TSQuantizedTokenizer,
+    tokens_path: str,
+    hf_cache_path: str,
+    path: str,
+    name: str,
+    target: str,
+    regenerate: bool = False,
+    streaming: bool = False,
+    split: str = "train",
+    chunk_toklimit: int = 250_000_000,  # 1GB per file
+    fit_on_n_samples: int = 1_000_000,  # subsample to fit tokenizer
+    **kwargs,
+) -> str:
+    """
+    Will prepare tokenized data if not already present.
+    Returns path to tokenized data.
+
+    For now we merge all data into single binary file. For simplicity.
+    """
+    if not os.path.exists(tokens_path) or regenerate:
+        if regenerate:
+            if os.path.exists(tokens_path):
+                print("Removing old data")
+                shutil.rmtree(tokens_path)
+
+        print("Tokenized data not found, creating...")
+        os.makedirs(tokens_path)
+
+        dataset = load_dataset(
+            path, name=name, cache_dir=hf_cache_path, split=split, streaming=streaming
+        )
+
+        ts = []
+        length = 0
+        for x in dataset:
+            val = x[target]
+            length += 1
+            ts.append(val)
+
+        ts = np.array(ts, dtype=np.float32)
+        print(f"Ts shape; {ts.shape}, total length: {length}")
+
+        if tokenizer.requires_fit():
+            tokenizer.fit(
+                np.random.choice(ts, size=min(fit_on_n_samples, length), replace=False)
+            )
+        encoded_inputs = tokenizer.encode(ts)
+        np_arr = np.array(
+            [x["input_ids"] for x in encoded_inputs], dtype=tokenizer.dtype
+        )
+        print(f"Total tokens: {len(np_arr)}, size in MBs: {len(np_arr) * 4 / 1e6:.2f}")
+        print(f"Shape {np_arr.shape}")
+        np_arr.tofile(os.path.join(tokens_path, f"{split}_tokens.bin"))
+        print(f"Saved tokenized data to {tokens_path}/{split}_tokens.bin")
+    else:
+        print("Tokenized data found, skipping creation")
+    return os.path.join(tokens_path, f"{split}_tokens.bin")

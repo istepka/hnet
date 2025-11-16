@@ -10,12 +10,12 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 import wandb
-from data import prepare_text_tokenized_data
+from data import prepare_timeseries_tokenized_data
 from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
 
 # HNet imports
 from hnet.models.mixer_seq import CausalLMOutput, HNetForCausalLM
-from hnet.utils.tokenizers import ByteTokenizer
+from hnet.utils.tokenizers import TSQuantizedTokenizer
 from hnet.utils.train import load_balancing_loss
 from train_helpers import plot_loss_curves, plot_words, prepare_group_params
 
@@ -38,6 +38,30 @@ def collate_batch(batch) -> torch.Tensor:
     return torch.stack(batch)
 
 
+class WandbLogger:
+    def __init__(
+        self, use_wandb: bool, run: wandb.sdk.wandb_run.Run | None = None
+    ) -> None:
+        self.use_wandb = use_wandb
+        self.run = run
+
+    def log(self, data: dict, step: int | None = None) -> None:
+        if self.use_wandb:
+            wandb.log(data, step=step)
+
+    def save(self, path: str) -> None:
+        if self.use_wandb:
+            wandb.save(path)
+
+    def finish(self) -> None:
+        if self.use_wandb:
+            wandb.finish()
+
+    def update_config(self, data: dict) -> None:
+        if self.use_wandb:
+            wandb.config.update(data)
+
+
 @hydra.main(version_base=None, config_path=".", config_name="config")
 def main(cfg: DictConfig) -> None:
     print("--- Configuration ---")
@@ -46,6 +70,8 @@ def main(cfg: DictConfig) -> None:
 
     # --- 1. Model Setup ---
     device = cfg.training.device if torch.cuda.is_available() else "cpu"
+
+    use_wandb = cfg.wandb.use
 
     # Resolve path relative to script
     model_config_path = hydra.utils.to_absolute_path(cfg.model.config_path)
@@ -64,15 +90,18 @@ def main(cfg: DictConfig) -> None:
     os.makedirs(ckpt_path, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    _ = wandb.init(
-        entity="istepka-carnegie-mellon-university",
-        project="hnet",
-        name=expeirment_name,
-        config=OmegaConf.to_container(cfg, resolve=True),
-    )
-
-    wandb.config.update({"model_config": config})
-    wandb.define_metric("val/*", summary="mean")
+    if use_wandb:
+        run = wandb.init(
+            entity="istepka-carnegie-mellon-university",
+            project="hnet",
+            name=expeirment_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+        wandb_logger = WandbLogger(use_wandb, run)
+        wandb_logger.update_config({"model_config": config})
+        wandb.define_metric("val/*", summary="mean")
+    else:
+        wandb_logger = WandbLogger(use_wandb)
 
     attn_cfg = AttnConfig(**config.pop("attn_cfg"))
     ssm_cfg = SSMConfig(**config.pop("ssm_cfg"))
@@ -81,29 +110,31 @@ def main(cfg: DictConfig) -> None:
     # --- 2. Data Preparation ---
     print(f"Loading tokenizer and dataset '{cfg.data.name}'...")
     input_len = cfg.data.input_len
-    tokenizer = ByteTokenizer()
+    tokenizer = TSQuantizedTokenizer()
 
-    train_tokens_path = prepare_text_tokenized_data(
+    train_tokens_path = prepare_timeseries_tokenized_data(
         tokenizer=tokenizer,
         tokens_path=os.path.join(tokens_dir, "train"),
         hf_cache_path=cfg.paths.hf_cache,
         regenerate=cfg.data.regenerate_tokens,
-        take_rows=cfg.data[cfg.data.name].train.take_rows,
+        # take_rows=cfg.data[cfg.data.name].train.take_rows,
         split="train",
         **cfg.data[cfg.data.name],
     )
-    valid_tokens_path = prepare_text_tokenized_data(
-        tokenizer=tokenizer,
-        tokens_path=os.path.join(tokens_dir, "validation"),
-        hf_cache_path=cfg.paths.hf_cache,
-        regenerate=cfg.data.regenerate_tokens,
-        take_rows=cfg.data[cfg.data.name].valid.take_rows,
-        split="validation",
-        **cfg.data[cfg.data.name],
-    )
+    # valid_tokens_path = prepare_timeseries_tokenized_data(
+    #     tokenizer=tokenizer,
+    #     tokens_path=os.path.join(tokens_dir, "validation"),
+    #     hf_cache_path=cfg.paths.hf_cache,
+    #     regenerate=cfg.data.regenerate_tokens,
+    #     # take_rows=cfg.data[cfg.data.name].valid.take_rows,
+    #     split="validation",
+    #     **cfg.data[cfg.data.name],
+    # )
+
+    # exit(0)
 
     train_dataset = TokDataset(train_tokens_path, block_size=input_len)
-    valid_dataset = TokDataset(valid_tokens_path, block_size=input_len)
+    # valid_dataset = TokDataset(valid_tokens_path, block_size=input_len)
     train_dl = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=cfg.data.batch_size,
@@ -114,22 +145,22 @@ def main(cfg: DictConfig) -> None:
         prefetch_factor=cfg.data.prefetch_factor,
         collate_fn=collate_batch,
     )
-    valid_dl = torch.utils.data.DataLoader(
-        valid_dataset,
-        batch_size=cfg.data.batch_size,
-        shuffle=False,
-        drop_last=True,
-        num_workers=cfg.data.num_workers,
-        pin_memory=cfg.data.pin_memory,
-        prefetch_factor=cfg.data.prefetch_factor,
-        collate_fn=collate_batch,
-    )
+    # valid_dl = torch.utils.data.DataLoader(
+    #     valid_dataset,
+    #     batch_size=cfg.data.batch_size,
+    #     shuffle=False,
+    #     drop_last=True,
+    #     num_workers=cfg.data.num_workers,
+    #     pin_memory=cfg.data.pin_memory,
+    #     prefetch_factor=cfg.data.prefetch_factor,
+    #     collate_fn=collate_batch,
+    # )
 
     # --- 3. Optimization Setup  ---
     print("Loading model...")
     model = HNetForCausalLM(hnet_cfg, device=device, dtype=torch.bfloat16)
     total_params = sum(p.numel() for p in model.parameters())
-    wandb.config.update({"total_params": total_params})
+    wandb_logger.update_config({"total_params": total_params})
     print(f"Total number of parameters: {total_params / 1e6:.2f}M")
 
     optimizer = prepare_group_params(model, **cfg.optimizer)
@@ -177,7 +208,7 @@ def main(cfg: DictConfig) -> None:
                     metric_aggregator[f"train/lb_loss_stage-{i}"].append(
                         stage_loss.item()
                     )
-                    wandb.log(
+                    wandb_logger.log(
                         {f"train/lb_loss_stage-{i}": stage_loss.item()}, step=step
                     )
 
@@ -196,7 +227,7 @@ def main(cfg: DictConfig) -> None:
             tq_bar.update(1)
             processed_tokens += inputs.numel()
 
-            wandb.log(
+            wandb_logger.log(
                 {
                     "train/ce_loss": ce.item(),
                     "train/lb_loss_total": lb_loss.item(),
@@ -229,51 +260,53 @@ def main(cfg: DictConfig) -> None:
                         save_path=os.path.join(output_dir, f"word_boundaries_s{step}"),
                     )
                     for i, path in enumerate(paths):
-                        wandb.log({f"wb/sentence_{i}": wandb.Image(path)}, step=step)
+                        wandb_logger.log(
+                            {f"wb/sentence_{i}": wandb.Image(path)}, step=step
+                        )
                 model.train()
 
-            if step % cfg.training.val_every == 0:
-                model.eval()
-                with torch.no_grad():
-                    for val_x in tqdm(valid_dl, desc="Validation", total=len(valid_dl)):
-                        val_x = val_x.to(device, non_blocking=True, dtype=torch.long)
-                        inputs = val_x[:, :-1]
-                        labels = val_x[:, 1:]
+            # if step % cfg.training.val_every == 0:
+            #     model.eval()
+            #     with torch.no_grad():
+            #         for val_x in tqdm(valid_dl, desc="Validation", total=len(valid_dl)):
+            #             val_x = val_x.to(device, non_blocking=True, dtype=torch.long)
+            #             inputs = val_x[:, :-1]
+            #             labels = val_x[:, 1:]
 
-                        mask = torch.ones(inputs.shape, device=device, dtype=torch.bool)
-                        output: CausalLMOutput = model(inputs, mask=mask)
-                        logits = output.logits
-                        bpred = output.bpred_output
+            #             mask = torch.ones(inputs.shape, device=device, dtype=torch.bool)
+            #             output: CausalLMOutput = model(inputs, mask=mask)
+            #             logits = output.logits
+            #             bpred = output.bpred_output
 
-                        # Compute cross-entropy loss
-                        ce = ce_loss(
-                            logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
-                        )
+            #             # Compute cross-entropy loss
+            #             ce = ce_loss(
+            #                 logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+            #             )
 
-                        brped0_bm = bpred[0].boundary_mask.squeeze().cpu().numpy()
-                        brped1_bm = bpred[1].boundary_mask.squeeze().cpu().numpy()
-                        l = len(brped0_bm)  # noqa
-                        comp0 = l / (brped0_bm == 1).sum()
-                        comp1 = l / (brped1_bm == 1).sum()
+            #             brped0_bm = bpred[0].boundary_mask.squeeze().cpu().numpy()
+            #             brped1_bm = bpred[1].boundary_mask.squeeze().cpu().numpy()
+            #             l = len(brped0_bm)  # noqa
+            #             comp0 = l / (brped0_bm == 1).sum()
+            #             comp1 = l / (brped1_bm == 1).sum()
 
-                        wandb.log(
-                            {
-                                "val/ce_loss": ce.item(),
-                                "val/perplexity": torch.exp(ce).item(),
-                                "val/compression_stage0": comp0,
-                                "val/compression_stage1": comp1,
-                            },
-                            step=step,
-                        )
+            #             wandb_logger.log(
+            #                 {
+            #                     "val/ce_loss": ce.item(),
+            #                     "val/perplexity": torch.exp(ce).item(),
+            #                     "val/compression_stage0": comp0,
+            #                     "val/compression_stage1": comp1,
+            #                 },
+            #                 step=step,
+            #             )
 
-                model.train()
+            #     model.train()
 
             if step >= cfg.training.total_steps:
                 finished = True
                 break
 
     torch.save(model.state_dict(), os.path.join(ckpt_path, f"step_{step}.pt"))
-    wandb.save(os.path.join(ckpt_path, f"step_{step}.pt"))
+    wandb_logger.save(os.path.join(ckpt_path, f"step_{step}.pt"))
 
     tq_bar.close()
     print("Training finished")
@@ -293,11 +326,11 @@ def main(cfg: DictConfig) -> None:
         save_path=os.path.join(output_dir, "word_boundaries"),
     )
     for i, path in enumerate(paths):
-        wandb.log({f"wb/sentence_{i}": wandb.Image(path)})
+        wandb_logger.log({f"wb/sentence_{i}": wandb.Image(path)})
 
     print(f"Run complete. Outputs saved to {output_dir}")
 
-    wandb.finish()
+    wandb_logger.finish()
 
 
 if __name__ == "__main__":
