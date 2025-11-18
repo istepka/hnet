@@ -4,7 +4,7 @@ import torch
 
 # HNet imports
 from hnet.models.mixer_seq import HNetForCausalLM
-from hnet.utils.tokenizers import ByteTokenizer
+from hnet.utils.tokenizers import ByteTokenizer, TSTokenizer
 from hnet.utils.train import apply_optimization_params, group_params
 
 
@@ -235,4 +235,124 @@ def plot_words(
             paths.append(path)
 
         print(f"Saved boundary visualizations to {save_path}")
+    return paths
+
+
+def plot_token_boundaries_ts(
+    model: HNetForCausalLM,
+    tokenizer: TSTokenizer,
+    sequences: torch.Tensor,  # shape (num_sequences, sequence_length), dtype torch.long
+    device: str,
+    save_path: str = "ts_token_boundaries",
+) -> list[str]:
+    """
+    Plots the dynamic chunking boundaries for a sample time series.
+    """
+    model.eval()
+    paths = []
+
+    with torch.no_grad():
+        mask = torch.ones(sequences.shape, device=device, dtype=torch.bool)
+        output = model.forward(sequences, mask=mask)
+        # bpred = output.bpred_output
+
+    sequences_np = sequences.cpu().numpy()
+    bpred_s0 = output.bpred_output[0]
+    bpred_s1 = output.bpred_output[1]
+
+    for i, encoded_ids in enumerate(sequences_np):
+        # Stage 0 boundaries
+        bpred0_bp = bpred_s0.boundary_prob[i].float().squeeze(0).cpu().numpy()
+        bpred0_bp = np.argmax(bpred0_bp, axis=-1)
+        brped0_bm = bpred_s0.boundary_mask[i].squeeze(0).cpu().numpy()
+        bpred0_sp = bpred_s0.selected_probs[i].squeeze(0).float().cpu().numpy()
+        # Stage 1 boundaries
+        bpred1_bp = bpred_s1.boundary_prob[i].squeeze(0).float().cpu().numpy()
+        bpred1_bp = np.argmax(bpred1_bp, axis=-1)
+        brped1_bm = bpred_s1.boundary_mask[i].squeeze(0).cpu().numpy()
+        bpred1_sp = bpred_s1.selected_probs[i].squeeze(0).float().cpu().numpy()
+
+        compression_ratio_stage0 = len(encoded_ids) / (brped0_bm == 1).sum()
+        compression_ratio_stage1 = (brped0_bm == 1).sum() / (brped1_bm == 1).sum()
+
+        print(f"Compression Ratio Stage Input -> 0: {compression_ratio_stage0:.2f}")
+        print(f"Compression Ratio Stage 0 -> 1: {compression_ratio_stage1:.2f}")
+        print(
+            f"Total Compression Ratio Input -> 1: {compression_ratio_stage0 * compression_ratio_stage1:.2f}"
+        )
+
+        # Print out shapes of everytihng for debugging
+        print(f"Encoded ids shape: {encoded_ids.shape}")
+        print(
+            f"bpred0_bp shape: {bpred0_bp.shape}, brped0_bm shape: {brped0_bm.shape}, bpred0_sp shape: {bpred0_sp.shape}"
+        )
+        print(
+            f"bpred1_bp shape: {bpred1_bp.shape}, brped1_bm shape: {brped1_bm.shape}, bpred1_sp shape: {bpred1_sp.shape}"
+        )
+
+        # Plotting decoded time series
+        decoded = tokenizer.decode(encoded_ids)
+
+        fig, ax = plt.subplots(figsize=(14, 4))
+        time_steps = np.arange(len(decoded))
+        ax.plot(time_steps, decoded, label="Time Series", color="lightblue")
+
+        # Stage 0 boundaries
+        ax.scatter(
+            range(len(bpred0_sp)),
+            [decoded.max() * 1.05] * len(bpred0_sp),
+            c=bpred0_sp,
+            cmap="Reds",
+            s=100,
+            label="Stage 0 Boundary probabilities",
+            marker="s",
+        )
+        ax.scatter(
+            range(len(brped0_bm)),
+            [decoded.max() * 1.1] * len(brped0_bm),
+            c=brped0_bm,
+            cmap="gray_r",
+            s=100,
+            label="Stage 0 Boundary mask",
+            marker="s",
+        )
+
+        # Stage 1 boundaries
+        indices = np.where(brped0_bm == True)[0]  # noqa
+        print(f"indices shape: {indices.shape}, brped1_bm shape: {brped1_bm.shape}")
+        print(f"brped0_bm: {brped0_bm.tolist()}")
+        print(f"indices: {indices}")
+        print(f"brped1_bm: {brped1_bm.tolist()}")
+        indices_sel = indices[brped1_bm]
+        print(f"indices_sel shape: {indices_sel.shape}")
+
+        ax.scatter(
+            indices,
+            [decoded.max() * 1.15] * len(indices),
+            c=bpred1_sp,
+            s=100,
+            label="Stage 1 Boundary Probabilities",
+            marker="s",
+            cmap="Reds",
+        )
+        ax.scatter(
+            indices_sel,
+            [decoded.max() * 1.2] * len(indices_sel),
+            c="black",
+            s=100,
+            label="Stage 1 Boundary Mask",
+            marker="s",
+        )
+        ax.set_yticks([])
+        ax.set_title(f"Time Series Token Boundaries Visualization for Sequence {i}")
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        plt.tight_layout()
+        path = save_path + f"{i}.png"
+        plt.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        paths.append(path)
+
+    print(f"Saved boundary visualizations to {save_path}")
     return paths

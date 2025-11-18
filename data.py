@@ -129,8 +129,9 @@ def prepare_timeseries_tokenized_data(
     split: str = "train",
     chunk_toklimit: int = 250_000_000,  # 1GB per file
     fit_on_n_samples: int = 1_000_000,  # subsample to fit tokenizer
+    split_manually_frac: float | None = None,
     **kwargs,
-) -> str:
+) -> str | list[str]:
     """
     Will prepare tokenized data if not already present.
     Returns path to tokenized data.
@@ -157,7 +158,7 @@ def prepare_timeseries_tokenized_data(
             length += 1
             ts.append(val)
 
-        ts = np.array(ts, dtype=np.float32)
+        ts = np.array(ts)
         print(f"Ts shape; {ts.shape}, total length: {length}")
 
         if tokenizer.requires_fit():
@@ -170,8 +171,30 @@ def prepare_timeseries_tokenized_data(
         )
         print(f"Total tokens: {len(np_arr)}, size in MBs: {len(np_arr) * 4 / 1e6:.2f}")
         print(f"Shape {np_arr.shape}")
-        np_arr.tofile(os.path.join(tokens_path, f"{split}_tokens.bin"))
-        print(f"Saved tokenized data to {tokens_path}/{split}_tokens.bin")
+
+        if not split_manually_frac:
+            np_arr.tofile(os.path.join(tokens_path, f"{split}_tokens.bin"))
+            return_path = os.path.join(tokens_path, f"{split}_tokens.bin")
+        else:
+            frac = split_manually_frac
+            split_idx = int(len(np_arr) * frac)
+            np_arr[:split_idx].tofile(os.path.join(tokens_path, "train_tokens.bin"))
+            np_arr[split_idx:].tofile(os.path.join(tokens_path, "test_tokens.bin"))
+            print(f"Manually split data at fraction {frac}, index {split_idx}")
+            return_path = [
+                os.path.join(tokens_path, "train_tokens.bin"),
+                os.path.join(tokens_path, "test_tokens.bin"),
+            ]
+
+        print(f"Saved tokenized data to {tokens_path}")
     else:
         print("Tokenized data found, skipping creation")
-    return os.path.join(tokens_path, f"{split}_tokens.bin")
+        return_path = None
+        for file in os.listdir(tokens_path):
+            if file.endswith(".bin") and split in file:
+                return_path = os.path.join(tokens_path, file)
+                break
+        assert (
+            return_path is not None
+        ), f"Could not find tokenized data file in {tokens_path}"
+    return return_path

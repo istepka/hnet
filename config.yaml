@@ -19,18 +19,21 @@ paths:
   model_cache: ${paths.scratch_dir}/model_cache
   hf_cache: /data/hf_cache
 
+# name: hnet_${data.name}_${model.stages}stage_${model.size}
+name: debug_ts
+
 wandb: 
   use: false
 
 model:
   stages: 2
-  size: S
+  size: L
   config_path: "configs/hnet_${model.stages}stage_${model.size}.json"
 
 data:
   name: tslib
-  input_len: 1024 # Input sequence length / context size
-  batch_size: 16 # Batch size for training, 128 x 256 fits on L40s GPU 
+  input_len: 256 # Input sequence length / context size
+  batch_size: 8 # Batch size for training, 128 x 256 fits on L40s GPU 
   num_workers: 2
   pin_memory: false
   prefetch_factor: null
@@ -52,21 +55,15 @@ data:
       take_rows: 2000000 # Take 2M rows
     valid:
       take_rows: 10000 # Take 10k rows
-  monash:
-    path: monash_tsf
-    name: weather
-    target: target
-    type: timeseries
-    streaming: False
   tslib:
     path: thuml/Time-Series-Library
     name: weather 
     target: OT
     type: timeseries
     streaming: False
+    split_manually_frac: 0.9  # Manually split 90% train, 10% valid
 
-# name: hnet_${data.name}_${model.stages}stage_${model.size}
-name: debug
+
 
 optimizer:
   base_lr: 6.25e-4
@@ -75,12 +72,12 @@ optimizer:
 
 training:
   device: cuda
-  total_steps: 1000 # Total training steps (batches)
+  total_steps: 30 # Total training steps (batches)
   log_every: 50 # Log training metrics every N steps
   alpha: 0.03 # Ratio loss weight
   n_ratios: [3, 2]  # N ratios for [Stage 0, Stage 1]
-  save_every: 250  # Save checkpoint every N steps
-  val_every: 100  # Validate every N steps
+  save_every: 100  # Save checkpoint every N steps
+  val_every: 20  # Validate every N steps
 
 plotting:
   plot_sentences: 
@@ -92,3 +89,5 @@ plotting:
     - ababababababababababababababababababababababababababa
     - ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab 
     - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  time_series:
+    batches_to_plot: 2

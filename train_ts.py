@@ -17,16 +17,19 @@ from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
 from hnet.models.mixer_seq import CausalLMOutput, HNetForCausalLM
 from hnet.utils.tokenizers import TSQuantizedTokenizer
 from hnet.utils.train import load_balancing_loss
-from train_helpers import plot_loss_curves, plot_words, prepare_group_params
+from train_helpers import plot_token_boundaries_ts, prepare_group_params
 
 
 class TokDataset(torch.utils.data.Dataset):
-    def __init__(self, path: str, block_size: int) -> None:
-        self.data = torch.from_numpy(np.memmap(path, dtype=np.int32, mode="r"))
+    def __init__(self, path: str, block_size: int, dtype: np.dtype) -> None:
+        self.data = np.fromfile(path, dtype=dtype)
+        self.data = torch.from_numpy(self.data)
+
         self.block_size = block_size
+        self.data_len = len(self.data) // self.block_size - 1
 
     def __len__(self) -> int:
-        return len(self.data) // self.block_size - 1
+        return self.data_len
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         i = idx * self.block_size
@@ -112,13 +115,11 @@ def main(cfg: DictConfig) -> None:
     input_len = cfg.data.input_len
     tokenizer = TSQuantizedTokenizer()
 
-    train_tokens_path = prepare_timeseries_tokenized_data(
+    tokens_paths = prepare_timeseries_tokenized_data(
         tokenizer=tokenizer,
         tokens_path=os.path.join(tokens_dir, "train"),
         hf_cache_path=cfg.paths.hf_cache,
         regenerate=cfg.data.regenerate_tokens,
-        # take_rows=cfg.data[cfg.data.name].train.take_rows,
-        split="train",
         **cfg.data[cfg.data.name],
     )
     # valid_tokens_path = prepare_timeseries_tokenized_data(
@@ -133,8 +134,16 @@ def main(cfg: DictConfig) -> None:
 
     # exit(0)
 
-    train_dataset = TokDataset(train_tokens_path, block_size=input_len)
-    # valid_dataset = TokDataset(valid_tokens_path, block_size=input_len)
+    valid_tokens_path = None
+    if isinstance(tokens_paths, str):
+        train_tokens_path = tokens_paths
+    else:
+        train_tokens_path = tokens_paths[0]
+        valid_tokens_path = tokens_paths[1]
+
+    train_dataset = TokDataset(
+        train_tokens_path, block_size=input_len, dtype=tokenizer.dtype
+    )
     train_dl = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=cfg.data.batch_size,
@@ -145,16 +154,21 @@ def main(cfg: DictConfig) -> None:
         prefetch_factor=cfg.data.prefetch_factor,
         collate_fn=collate_batch,
     )
-    # valid_dl = torch.utils.data.DataLoader(
-    #     valid_dataset,
-    #     batch_size=cfg.data.batch_size,
-    #     shuffle=False,
-    #     drop_last=True,
-    #     num_workers=cfg.data.num_workers,
-    #     pin_memory=cfg.data.pin_memory,
-    #     prefetch_factor=cfg.data.prefetch_factor,
-    #     collate_fn=collate_batch,
-    # )
+    run_validation = valid_tokens_path is not None
+    if run_validation:
+        valid_dataset = TokDataset(
+            valid_tokens_path, block_size=input_len, dtype=tokenizer.dtype
+        )
+        valid_dl = torch.utils.data.DataLoader(
+            valid_dataset,
+            batch_size=cfg.data.batch_size,
+            shuffle=False,
+            drop_last=True,
+            num_workers=cfg.data.num_workers,
+            pin_memory=cfg.data.pin_memory,
+            prefetch_factor=cfg.data.prefetch_factor,
+            collate_fn=collate_batch,
+        )
 
     # --- 3. Optimization Setup  ---
     print("Loading model...")
@@ -182,6 +196,7 @@ def main(cfg: DictConfig) -> None:
 
         for x in train_dl:
             assert isinstance(x, torch.Tensor), "Batch data should be a torch.Tensor"
+            # print(f"Batch shape: {x.shape}")
             x = x.to(device, non_blocking=True, dtype=torch.long)
             inputs = x[:, :-1]
             labels = x[:, 1:]
@@ -249,57 +264,73 @@ def main(cfg: DictConfig) -> None:
                     model.state_dict(), os.path.join(ckpt_path, f"step_{step}.pt")
                 )
 
-                # Evaluation plots during training
+            if step % cfg.training.val_every == 0 and run_validation:
                 model.eval()
+                val_batches_to_plot = cfg.plotting.time_series.batches_to_plot
                 with torch.no_grad():
-                    paths = plot_words(
-                        model,
-                        tokenizer,
-                        cfg.plotting.plot_sentences,
-                        device,
-                        save_path=os.path.join(output_dir, f"word_boundaries_s{step}"),
-                    )
-                    for i, path in enumerate(paths):
-                        wandb_logger.log(
-                            {f"wb/sentence_{i}": wandb.Image(path)}, step=step
+                    _it = 0
+                    for val_x in tqdm(valid_dl, desc="Validation", total=len(valid_dl)):
+                        val_x = val_x.to(device, non_blocking=True, dtype=torch.long)
+                        inputs = val_x[:, :-1]
+                        labels = val_x[:, 1:]
+
+                        mask = torch.ones(inputs.shape, device=device, dtype=torch.bool)
+                        output: CausalLMOutput = model(inputs, mask=mask)
+                        logits = output.logits
+                        bpred = output.bpred_output
+
+                        # Compute cross-entropy loss
+                        ce = ce_loss(
+                            logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                         )
+
+                        brped0_bm = bpred[0].boundary_mask.squeeze().cpu().numpy()
+                        brped1_bm = bpred[1].boundary_mask.squeeze().cpu().numpy()
+                        l = len(brped0_bm)  # noqa
+                        comp0 = l / (brped0_bm == 1).sum()
+                        comp1 = l / (brped1_bm == 1).sum()
+
+                        # Compute MSE on decoded values of the forecast
+                        decoded = tokenizer.decode(inputs[:].cpu().numpy())
+                        original = tokenizer.decode(val_x[:, 1:].cpu().numpy())
+                        mse = np.mean((decoded - original) ** 2)
+                        mae = np.mean(np.abs(decoded - original))
+                        mape = (
+                            np.mean(np.abs((decoded - original) / (original + 1e-8)))
+                            * 100
+                        )
+
+                        wandb_logger.log(
+                            {
+                                "val/ce_loss": ce.item(),
+                                "val/perplexity": torch.exp(ce).item(),
+                                "val/compression_stage0": comp0,
+                                "val/compression_stage1": comp1,
+                                "val/mse": mse,
+                                "val/mae": mae,
+                                "val/mape": mape,
+                            },
+                            step=step,
+                        )
+
+                        if _it >= val_batches_to_plot:
+                            break
+
+                        paths = plot_token_boundaries_ts(
+                            model,
+                            tokenizer,
+                            inputs,
+                            device,
+                            save_path=os.path.join(
+                                output_dir, f"token_boundaries_step_{step}"
+                            ),
+                        )
+                        for i, path in enumerate(paths):
+                            wandb_logger.log(
+                                {f"wb/series_{i}": wandb.Image(path)}, step=step
+                            )
+                        _it += 1
                 model.train()
-
-            # if step % cfg.training.val_every == 0:
-            #     model.eval()
-            #     with torch.no_grad():
-            #         for val_x in tqdm(valid_dl, desc="Validation", total=len(valid_dl)):
-            #             val_x = val_x.to(device, non_blocking=True, dtype=torch.long)
-            #             inputs = val_x[:, :-1]
-            #             labels = val_x[:, 1:]
-
-            #             mask = torch.ones(inputs.shape, device=device, dtype=torch.bool)
-            #             output: CausalLMOutput = model(inputs, mask=mask)
-            #             logits = output.logits
-            #             bpred = output.bpred_output
-
-            #             # Compute cross-entropy loss
-            #             ce = ce_loss(
-            #                 logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
-            #             )
-
-            #             brped0_bm = bpred[0].boundary_mask.squeeze().cpu().numpy()
-            #             brped1_bm = bpred[1].boundary_mask.squeeze().cpu().numpy()
-            #             l = len(brped0_bm)  # noqa
-            #             comp0 = l / (brped0_bm == 1).sum()
-            #             comp1 = l / (brped1_bm == 1).sum()
-
-            #             wandb_logger.log(
-            #                 {
-            #                     "val/ce_loss": ce.item(),
-            #                     "val/perplexity": torch.exp(ce).item(),
-            #                     "val/compression_stage0": comp0,
-            #                     "val/compression_stage1": comp1,
-            #                 },
-            #                 step=step,
-            #             )
-
-            #     model.train()
 
             if step >= cfg.training.total_steps:
                 finished = True
@@ -313,20 +344,20 @@ def main(cfg: DictConfig) -> None:
 
     # --- 5. Plotting  ---
     # Hydra will save these plots to the output directory
-    print("Generating plots")
-    model.eval()
-    plot_loss_curves(
-        experiment_logs, save_path=os.path.join(output_dir, "loss_curves.png")
-    )
-    paths = plot_words(
-        model,
-        tokenizer,
-        cfg.plotting.plot_sentences,
-        device,
-        save_path=os.path.join(output_dir, "word_boundaries"),
-    )
-    for i, path in enumerate(paths):
-        wandb_logger.log({f"wb/sentence_{i}": wandb.Image(path)})
+    # print("Generating plots")
+    # model.eval()
+    # plot_loss_curves(
+    #     experiment_logs, save_path=os.path.join(output_dir, "loss_curves.png")
+    # )
+    # paths = plot_words(
+    #     model,
+    #     tokenizer,
+    #     cfg.plotting.plot_sentences,
+    #     device,
+    #     save_path=os.path.join(output_dir, "word_boundaries"),
+    # )
+    # for i, path in enumerate(paths):
+    #     wandb_logger.log({f"wb/sentence_{i}": wandb.Image(path)})
 
     print(f"Run complete. Outputs saved to {output_dir}")
 
