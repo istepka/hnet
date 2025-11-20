@@ -17,52 +17,13 @@ from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
 from hnet.models.mixer_seq import CausalLMOutput, HNetForCausalLM
 from hnet.utils.tokenizers import TSQuantizedTokenizer
 from hnet.utils.train import load_balancing_loss
-from train_helpers import plot_token_boundaries_ts, prepare_group_params
-
-
-class TokDataset(torch.utils.data.Dataset):
-    def __init__(self, path: str, block_size: int, dtype: np.dtype) -> None:
-        self.data = np.fromfile(path, dtype=dtype)
-        self.data = torch.from_numpy(self.data)
-
-        self.block_size = block_size
-        self.data_len = len(self.data) // self.block_size - 1
-
-    def __len__(self) -> int:
-        return self.data_len
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        i = idx * self.block_size
-        x = self.data[i : i + self.block_size + 1]  # +1 for shifting later
-        return x
-
-
-def collate_batch(batch) -> torch.Tensor:
-    return torch.stack(batch)
-
-
-class WandbLogger:
-    def __init__(
-        self, use_wandb: bool, run: wandb.sdk.wandb_run.Run | None = None
-    ) -> None:
-        self.use_wandb = use_wandb
-        self.run = run
-
-    def log(self, data: dict, step: int | None = None) -> None:
-        if self.use_wandb:
-            wandb.log(data, step=step)
-
-    def save(self, path: str) -> None:
-        if self.use_wandb:
-            wandb.save(path)
-
-    def finish(self) -> None:
-        if self.use_wandb:
-            wandb.finish()
-
-    def update_config(self, data: dict) -> None:
-        if self.use_wandb:
-            wandb.config.update(data)
+from train_helpers import (
+    TokDataset,
+    WandbLogger,
+    collate_batch,
+    plot_token_boundaries_ts,
+    prepare_group_params,
+)
 
 
 @hydra.main(version_base=None, config_path=".", config_name="config")
@@ -75,18 +36,24 @@ def main(cfg: DictConfig) -> None:
     device = cfg.training.device if torch.cuda.is_available() else "cpu"
 
     use_wandb = cfg.wandb.use
+    seed = cfg.seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     # Resolve path relative to script
     model_config_path = hydra.utils.to_absolute_path(cfg.model.config_path)
     with open(model_config_path, "r") as f:
         config = json.load(f)
+    config["vocab_size"] = cfg.model.vocab_size
 
     unique_id = wandb.util.generate_id()
     experiment_dir = cfg.paths.experiment_dir
     data_dir = cfg.paths.data_dir
     expeirment_name = cfg.name
     output_dir = os.path.join(experiment_dir, expeirment_name + "_" + unique_id)
-    tokens_dir = os.path.join(data_dir, "tokens", cfg.data.name)
+    tokens_dir = os.path.join(
+        data_dir, "tokens", cfg.data.name, cfg.data[cfg.data.name].name
+    )
     ckpt_path = cfg.paths.checkpoint_save_path
     ckpt_path = os.path.join(ckpt_path, cfg.name + "_" + unique_id)
     os.makedirs(data_dir, exist_ok=True)
@@ -109,30 +76,25 @@ def main(cfg: DictConfig) -> None:
     attn_cfg = AttnConfig(**config.pop("attn_cfg"))
     ssm_cfg = SSMConfig(**config.pop("ssm_cfg"))
     hnet_cfg = HNetConfig(**config, attn_cfg=attn_cfg, ssm_cfg=ssm_cfg)
+    stages = cfg.model.stages
 
     # --- 2. Data Preparation ---
     print(f"Loading tokenizer and dataset '{cfg.data.name}'...")
     input_len = cfg.data.input_len
-    tokenizer = TSQuantizedTokenizer()
+    if cfg.model.tokenizer == "ts_quantized":
+        tokenizer = TSQuantizedTokenizer(
+            vocab_size=cfg.model.vocab_size, quant_type="cdf"
+        )
+    else:
+        raise ValueError(f"Unsupported tokenizer: {cfg.model.tokenizer}")
 
     tokens_paths = prepare_timeseries_tokenized_data(
         tokenizer=tokenizer,
-        tokens_path=os.path.join(tokens_dir, "train"),
+        tokens_path=tokens_dir,
         hf_cache_path=cfg.paths.hf_cache,
         regenerate=cfg.data.regenerate_tokens,
         **cfg.data[cfg.data.name],
     )
-    # valid_tokens_path = prepare_timeseries_tokenized_data(
-    #     tokenizer=tokenizer,
-    #     tokens_path=os.path.join(tokens_dir, "validation"),
-    #     hf_cache_path=cfg.paths.hf_cache,
-    #     regenerate=cfg.data.regenerate_tokens,
-    #     # take_rows=cfg.data[cfg.data.name].valid.take_rows,
-    #     split="validation",
-    #     **cfg.data[cfg.data.name],
-    # )
-
-    # exit(0)
 
     valid_tokens_path = None
     if isinstance(tokens_paths, str):
@@ -238,8 +200,6 @@ def main(cfg: DictConfig) -> None:
             metric_aggregator["total_loss"].append(loss.item())
             metric_aggregator["perplexity"].append(ppl)
 
-            step += 1
-            tq_bar.update(1)
             processed_tokens += inputs.numel()
 
             wandb_logger.log(
@@ -283,16 +243,14 @@ def main(cfg: DictConfig) -> None:
                         ce = ce_loss(
                             logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                         )
+                        predictions = torch.argmax(logits, dim=-1)
 
-                        brped0_bm = bpred[0].boundary_mask.squeeze().cpu().numpy()
-                        brped1_bm = bpred[1].boundary_mask.squeeze().cpu().numpy()
-                        l = len(brped0_bm)  # noqa
-                        comp0 = l / (brped0_bm == 1).sum()
-                        comp1 = l / (brped1_bm == 1).sum()
+                        brped0_bm = bpred[0].boundary_mask
+                        comp0 = brped0_bm.numel() / (brped0_bm == 1).sum()
 
                         # Compute MSE on decoded values of the forecast
-                        decoded = tokenizer.decode(inputs[:].cpu().numpy())
-                        original = tokenizer.decode(val_x[:, 1:].cpu().numpy())
+                        decoded = tokenizer.decode(predictions.cpu().numpy())
+                        original = tokenizer.decode(labels.cpu().numpy())
                         mse = np.mean((decoded - original) ** 2)
                         mae = np.mean(np.abs(decoded - original))
                         mape = (
@@ -300,18 +258,21 @@ def main(cfg: DictConfig) -> None:
                             * 100
                         )
 
-                        wandb_logger.log(
-                            {
-                                "val/ce_loss": ce.item(),
-                                "val/perplexity": torch.exp(ce).item(),
-                                "val/compression_stage0": comp0,
-                                "val/compression_stage1": comp1,
-                                "val/mse": mse,
-                                "val/mae": mae,
-                                "val/mape": mape,
-                            },
-                            step=step,
-                        )
+                        _log = {
+                            "val/ce_loss": ce.item(),
+                            "val/perplexity": torch.exp(ce).item(),
+                            "val/compression_stage0": comp0,
+                            "val/mse": mse,
+                            "val/mae": mae,
+                            "val/mape": mape,
+                        }
+
+                        if stages == 2:
+                            bpred1_bm = bpred[1].boundary_mask
+                            comp1 = bpred1_bm.numel() / (bpred1_bm == 1).sum()
+                            _log["val/compression_stage1"] = comp1
+
+                        wandb_logger.log(_log, step=step)
 
                         if _it >= val_batches_to_plot:
                             break
@@ -335,6 +296,9 @@ def main(cfg: DictConfig) -> None:
             if step >= cfg.training.total_steps:
                 finished = True
                 break
+
+            step += 1
+            tq_bar.update(1)
 
     torch.save(model.state_dict(), os.path.join(ckpt_path, f"step_{step}.pt"))
     wandb_logger.save(os.path.join(ckpt_path, f"step_{step}.pt"))

@@ -21,14 +21,17 @@ paths:
 
 # name: hnet_${data.name}_${model.stages}stage_${model.size}
 name: debug_ts
-
+seed: 67
 wandb: 
-  use: false
+  use: true
+  tags: ["${data.input_len}", "${data.name}", "${model.stages}-stage", "${model.size}", "${model.vocab_size}"]
 
 model:
-  stages: 2
-  size: L
+  stages: 1
+  size: XXS
   config_path: "configs/hnet_${model.stages}stage_${model.size}.json"
+  tokenizer: ts_quantized
+  vocab_size: 256
 
 data:
   name: tslib
@@ -57,7 +60,7 @@ data:
       take_rows: 10000 # Take 10k rows
   tslib:
     path: thuml/Time-Series-Library
-    name: weather 
+    name: ETTm2 # weather dataset 
     target: OT
     type: timeseries
     streaming: False
@@ -66,18 +69,18 @@ data:
 
 
 optimizer:
-  base_lr: 6.25e-4
+  base_lr: 1e-4 # 6.25e-4 
   weight_decay: 0.1
   lr_multipliers: [2.0, 1.5, 1.0]   # [Stage 0, Stage 1, Main Network]
 
 training:
   device: cuda
-  total_steps: 30 # Total training steps (batches)
+  total_steps: 300 # Total training steps (batches)
   log_every: 50 # Log training metrics every N steps
   alpha: 0.03 # Ratio loss weight
-  n_ratios: [3, 2]  # N ratios for [Stage 0, Stage 1]
+  n_ratios: [8, 3]  # N ratios for [Stage 0, Stage 1]
   save_every: 100  # Save checkpoint every N steps
-  val_every: 20  # Validate every N steps
+  val_every: 50  # Validate every N steps
 
 plotting:
   plot_sentences: 

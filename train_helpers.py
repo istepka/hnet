@@ -2,10 +2,57 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+import wandb
+
 # HNet imports
 from hnet.models.mixer_seq import HNetForCausalLM
 from hnet.utils.tokenizers import ByteTokenizer, TSTokenizer
 from hnet.utils.train import apply_optimization_params, group_params
+
+
+class TokDataset(torch.utils.data.Dataset):
+    def __init__(self, path: str, block_size: int, dtype: np.dtype) -> None:
+        self.data = np.fromfile(path, dtype=dtype)
+        self.data = torch.from_numpy(self.data)
+
+        self.block_size = block_size
+        self.data_len = len(self.data) // self.block_size - 1
+
+    def __len__(self) -> int:
+        return self.data_len
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        i = idx * self.block_size
+        x = self.data[i : i + self.block_size + 1]  # +1 for shifting later
+        return x
+
+
+def collate_batch(batch) -> torch.Tensor:
+    return torch.stack(batch)
+
+
+class WandbLogger:
+    def __init__(
+        self, use_wandb: bool, run: wandb.sdk.wandb_run.Run | None = None
+    ) -> None:
+        self.use_wandb = use_wandb
+        self.run = run
+
+    def log(self, data: dict, step: int | None = None) -> None:
+        if self.use_wandb:
+            wandb.log(data, step=step)
+
+    def save(self, path: str) -> None:
+        if self.use_wandb:
+            wandb.save(path)
+
+    def finish(self) -> None:
+        if self.use_wandb:
+            wandb.finish()
+
+    def update_config(self, data: dict) -> None:
+        if self.use_wandb:
+            wandb.config.update(data)
 
 
 def prepare_group_params(
@@ -18,7 +65,6 @@ def prepare_group_params(
     Prepares optimizer parameter groups with different learning rates and weight decays.
     Hardcoded for 2stage HNet model as per the current configuration.
     """
-    assert hasattr(model.backbone.main_network, "encoder"), "Model is not S=2"
     assert (
         len(lr_multipliers) == 3
     ), f"Expecting 3 LR multipliers for S=2, got {len(lr_multipliers)}"
@@ -257,8 +303,11 @@ def plot_token_boundaries_ts(
         # bpred = output.bpred_output
 
     sequences_np = sequences.cpu().numpy()
+    stages = len(output.bpred_output)
     bpred_s0 = output.bpred_output[0]
-    bpred_s1 = output.bpred_output[1]
+
+    if stages == 2:
+        bpred_s1 = output.bpred_output[1]
 
     for i, encoded_ids in enumerate(sequences_np):
         # Stage 0 boundaries
@@ -266,29 +315,27 @@ def plot_token_boundaries_ts(
         bpred0_bp = np.argmax(bpred0_bp, axis=-1)
         brped0_bm = bpred_s0.boundary_mask[i].squeeze(0).cpu().numpy()
         bpred0_sp = bpred_s0.selected_probs[i].squeeze(0).float().cpu().numpy()
-        # Stage 1 boundaries
-        bpred1_bp = bpred_s1.boundary_prob[i].squeeze(0).float().cpu().numpy()
-        bpred1_bp = np.argmax(bpred1_bp, axis=-1)
-        brped1_bm = bpred_s1.boundary_mask[i].squeeze(0).cpu().numpy()
-        bpred1_sp = bpred_s1.selected_probs[i].squeeze(0).float().cpu().numpy()
-
         compression_ratio_stage0 = len(encoded_ids) / (brped0_bm == 1).sum()
-        compression_ratio_stage1 = (brped0_bm == 1).sum() / (brped1_bm == 1).sum()
-
         print(f"Compression Ratio Stage Input -> 0: {compression_ratio_stage0:.2f}")
-        print(f"Compression Ratio Stage 0 -> 1: {compression_ratio_stage1:.2f}")
-        print(
-            f"Total Compression Ratio Input -> 1: {compression_ratio_stage0 * compression_ratio_stage1:.2f}"
-        )
-
-        # Print out shapes of everytihng for debugging
         print(f"Encoded ids shape: {encoded_ids.shape}")
         print(
             f"bpred0_bp shape: {bpred0_bp.shape}, brped0_bm shape: {brped0_bm.shape}, bpred0_sp shape: {bpred0_sp.shape}"
         )
-        print(
-            f"bpred1_bp shape: {bpred1_bp.shape}, brped1_bm shape: {brped1_bm.shape}, bpred1_sp shape: {bpred1_sp.shape}"
-        )
+        print(f"1s in bpred0_bm: {brped0_bm.sum()}")
+
+        if stages == 2:
+            # Stage 1 boundaries
+            bpred1_bp = bpred_s1.boundary_prob[i].squeeze(0).float().cpu().numpy()
+            bpred1_bp = np.argmax(bpred1_bp, axis=-1)
+            brped1_bm = bpred_s1.boundary_mask[i].squeeze(0).cpu().numpy()
+            bpred1_sp = bpred_s1.selected_probs[i].squeeze(0).float().cpu().numpy()
+            compression_ratio_stage1 = (brped0_bm == 1).sum() / (brped1_bm == 1).sum()
+
+            print(f"Compression Ratio Stage 0 -> 1: {compression_ratio_stage1:.2f}")
+            print(
+                f"bpred1_bp shape: {bpred1_bp.shape}, brped1_bm shape: {brped1_bm.shape}, bpred1_sp shape: {bpred1_sp.shape}"
+            )
+            print(f"1s in brped1_bm: {brped1_bm.sum()}")
 
         # Plotting decoded time series
         decoded = tokenizer.decode(encoded_ids)
@@ -296,11 +343,14 @@ def plot_token_boundaries_ts(
         fig, ax = plt.subplots(figsize=(14, 4))
         time_steps = np.arange(len(decoded))
         ax.plot(time_steps, decoded, label="Time Series", color="lightblue")
+        # Draw Stage 1 boundaries as vertical lines overlaid on the plot
+        for x in np.where(brped0_bm == 1)[0]:
+            ax.axvline(x=x, color="gray", linestyle=":", alpha=0.2)
 
         # Stage 0 boundaries
         ax.scatter(
-            range(len(bpred0_sp)),
-            [decoded.max() * 1.05] * len(bpred0_sp),
+            time_steps,
+            [decoded.max() * 1.1] * len(bpred0_sp),
             c=bpred0_sp,
             cmap="Reds",
             s=100,
@@ -308,8 +358,8 @@ def plot_token_boundaries_ts(
             marker="s",
         )
         ax.scatter(
-            range(len(brped0_bm)),
-            [decoded.max() * 1.1] * len(brped0_bm),
+            time_steps,
+            [decoded.max() * 1.05] * len(brped0_bm),
             c=brped0_bm,
             cmap="gray_r",
             s=100,
@@ -317,34 +367,36 @@ def plot_token_boundaries_ts(
             marker="s",
         )
 
-        # Stage 1 boundaries
-        indices = np.where(brped0_bm == True)[0]  # noqa
-        print(f"indices shape: {indices.shape}, brped1_bm shape: {brped1_bm.shape}")
-        print(f"brped0_bm: {brped0_bm.tolist()}")
-        print(f"indices: {indices}")
-        print(f"brped1_bm: {brped1_bm.tolist()}")
-        indices_sel = indices[brped1_bm]
-        print(f"indices_sel shape: {indices_sel.shape}")
+        if stages == 2:
+            # Stage 1 boundaries
+            indices = np.where(brped0_bm == True)[0]  # noqa
+            print(f"indices shape: {indices.shape}, brped1_bm shape: {brped1_bm.shape}")
+            print(f"brped0_bm: {brped0_bm.tolist()}")
+            print(f"indices: {indices}")
+            print(f"brped1_bm: {brped1_bm.tolist()}")
+            print(f"Inputs {encoded_ids.tolist()}")
+            indices_sel = indices[brped1_bm]
+            print(f"indices_sel shape: {indices_sel.shape}")
 
-        ax.scatter(
-            indices,
-            [decoded.max() * 1.15] * len(indices),
-            c=bpred1_sp,
-            s=100,
-            label="Stage 1 Boundary Probabilities",
-            marker="s",
-            cmap="Reds",
-        )
-        ax.scatter(
-            indices_sel,
-            [decoded.max() * 1.2] * len(indices_sel),
-            c="black",
-            s=100,
-            label="Stage 1 Boundary Mask",
-            marker="s",
-        )
+            ax.scatter(
+                indices,
+                [decoded.max() * 1.15] * len(indices),
+                c=bpred1_sp,
+                s=100,
+                label="Stage 1 Boundary Probabilities",
+                marker="s",
+                cmap="Reds",
+            )
+            ax.scatter(
+                indices_sel,
+                [decoded.max() * 1.2] * len(indices_sel),
+                c="black",
+                s=100,
+                label="Stage 1 Boundary Mask",
+                marker="s",
+            )
         ax.set_yticks([])
-        ax.set_title(f"Time Series Token Boundaries Visualization for Sequence {i}")
+        # ax.set_title(f"Time Series Token Boundaries Visualization for Sequence {i}")
         for spine in ax.spines.values():
             spine.set_visible(False)
         plt.tight_layout()
